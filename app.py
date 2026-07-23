@@ -2,518 +2,250 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import numpy as np
-import time
-import json
-import sqlite3
-import uuid
-import logging
-import gc # 🔥 RAM ক্লিয়ার করার জন্য গার্বেজ কালেক্টর
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
+import requests
 from streamlit_autorefresh import st_autorefresh
 
-# ================= 👑 1. PAGE CONFIGURATION & LOGGING =================
-st.set_page_config(page_title="TRADE MENTOR: APEX QUANT (v37)", layout="wide", initial_sidebar_state="expanded")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ================= ⚙️ V56 LIVE CONFIGURATION =================
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
 
-SCALPING_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-DB_FILE = "trading_data_v37.db" 
+COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+EXECUTION_THRESHOLD = 75  # ✅ Institutional strictness (75+)
+TARGET_RR = 2.4
 
-# ================= 🎨 2. PREMIUM CSS =================
+st.set_page_config(page_title="Prime Samaresh Live Terminal v56", layout="wide")
+
+# Auto-refresh every 30 seconds for 24/7 Live Monitoring
+st_autorefresh(interval=30000, key="v56_live_refresh")
+
+# Initialize Session State for Unique Telegram Alert Memory
+if 'last_sent_signal' not in st.session_state:
+    st.session_state['last_sent_signal'] = ""
+
+# Custom CSS for UI
 st.markdown("""
     <style>
-    html, body, [data-testid="stAppViewContainer"] { background-color: #0B0E11 !important; color: #EAECEF !important; }
-    ::-webkit-scrollbar { width: 8px !important; }
-    ::-webkit-scrollbar-thumb { background: #00FFCC !important; border-radius: 10px; }
-    .dash-card { background-color: #1E2329; border-radius: 8px; padding: 15px; text-align: center; border-bottom: 3px solid #00FFCC; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);}
-    .stat-card { background-color: #181A20; border-radius: 6px; padding: 10px; text-align: center; border-left: 3px solid #FCD535; margin-bottom: 15px;}
-    .stat-title { font-size: 12px; color: #848E9C; text-transform: uppercase; margin-bottom: 5px;}
-    .active-trade { background: linear-gradient(90deg, rgba(0,255,204,0.1) 0%, #181A20 100%); border-left: 4px solid #00FFCC; padding: 12px; border-radius: 8px; margin-bottom: 10px; font-size: 14px;}
-    .pending-trade { background: linear-gradient(90deg, rgba(255,165,0,0.1) 0%, #181A20 100%); border-left: 4px solid #FFA500; padding: 12px; border-radius: 8px; margin-bottom: 10px; font-size: 14px;}
-    div.stButton > button { background-color: #1E2329 !important; color: #EAECEF !important; border: 1px solid #FF1744 !important; margin-top: 10px;}
-    div.stButton > button:hover { background-color: #FF1744 !important; color: #FFFFFF !important;}
+    .signal-buy { background-color: rgba(0,255,170,0.15); padding: 12px; border-radius: 8px; border-left: 6px solid #00FFAA; }
+    .signal-sell { background-color: rgba(255,68,68,0.15); padding: 12px; border-radius: 8px; border-left: 6px solid #FF4444; }
+    .signal-wait { background-color: rgba(255,255,255,0.03); padding: 10px; border-radius: 8px; border-left: 6px solid #666; }
     </style>
 """, unsafe_allow_html=True)
 
-# ================= 🗄️ 3. PURE RELATIONAL SQLITE MANAGER =================
-def init_db():
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, balance REAL, total_fees REAL, live_mode INTEGER, cooldowns TEXT, daily_pnl REAL, date_tracker TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS open_trades (coin TEXT PRIMARY KEY, data TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS pending_orders (coin TEXT PRIMARY KEY, data TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS trades (uuid TEXT PRIMARY KEY, timestamp INTEGER, time TEXT, coin TEXT, type TEXT, entry_tags TEXT, reason TEXT, pnl REAL, fee REAL, risk REAL)''')
-        
-        c.execute("SELECT id FROM bot_state WHERE id=1")
-        if not c.fetchone():
-            c.execute("INSERT INTO bot_state (id, balance, total_fees, live_mode, cooldowns, daily_pnl, date_tracker) VALUES (1, 1000.0, 0.0, 0, '{}', 0.0, '')")
-        conn.commit()
+# ================= 📡 DATA FETCHING (BINANCE FUTURES) =================
+@st.cache_resource
+def get_exchange():
+    return ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 
-def load_data():
-    init_db()
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("SELECT balance, total_fees, live_mode, cooldowns, daily_pnl, date_tracker FROM bot_state WHERE id=1")
-        row = c.fetchone()
-        
-        df_hist = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 1000", conn)
-        st.session_state.trade_history_df = df_hist
-        
-        c.execute("SELECT coin, data FROM open_trades")
-        st.session_state.open_trades = {coin: json.loads(data) for coin, data in c.fetchall()}
-        
-        c.execute("SELECT coin, data FROM pending_orders")
-        st.session_state.pending_orders = {coin: json.loads(data) for coin, data in c.fetchall()}
-
-    current_utc_date = str(datetime.now(timezone.utc).date()) 
-    if row:
-        st.session_state.balance = row[0]
-        st.session_state.total_fees = row[1]
-        st.session_state.live_mode = bool(row[2])
-        st.session_state.cooldowns = json.loads(row[3]) if row[3] else {}
-        if row[5] != current_utc_date:
-            st.session_state.daily_pnl = 0.0
-            st.session_state.date_tracker = current_utc_date
-        else:
-            st.session_state.daily_pnl = row[4]
-            st.session_state.date_tracker = row[5]
-
-def save_data():
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        conn.execute("BEGIN IMMEDIATE") 
-        c = conn.cursor()
-        c.execute('''UPDATE bot_state SET balance=?, total_fees=?, live_mode=?, cooldowns=?, daily_pnl=?, date_tracker=? WHERE id=1''',
-                  (st.session_state.balance, st.session_state.total_fees, int(st.session_state.live_mode),
-                   json.dumps(st.session_state.cooldowns), st.session_state.daily_pnl, st.session_state.date_tracker))
-        
-        c.execute("DELETE FROM open_trades")
-        for coin, data in st.session_state.open_trades.items():
-            c.execute("INSERT INTO open_trades (coin, data) VALUES (?, ?)", (coin, json.dumps(data)))
-            
-        c.execute("DELETE FROM pending_orders")
-        for coin, data in st.session_state.pending_orders.items():
-            c.execute("INSERT INTO pending_orders (coin, data) VALUES (?, ?)", (coin, json.dumps(data)))
-        conn.commit()
-
-def log_trade_db(t_uuid, timestamp, t_time, coin, t_type, entry_tags, reason, pnl, fee, risk):
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        c = conn.cursor()
-        c.execute("INSERT INTO trades (uuid, timestamp, time, coin, type, entry_tags, reason, pnl, fee, risk) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  (str(t_uuid), timestamp, str(t_time), coin, t_type, entry_tags, reason, float(pnl), float(fee), float(risk)))
-        conn.commit()
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        st.session_state.trade_history_df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 1000", conn)
-
-if 'data_loaded' not in st.session_state:
-    load_data()
-    st.session_state.data_loaded = True
-
-# ================= 🛡️ RISK ENGINE & UI =================
-st.sidebar.markdown("<h3 style='color:#EAECEF;'>⚙️ v37 PRE-PRODUCTION</h3>", unsafe_allow_html=True)
-
-# 🔥 RAM বাঁচাতে রিফ্রেশ রেট 15s করা হয়েছে
-refresh_rate = st.sidebar.slider("রিফ্রেশ রেট (সেকেন্ড)", min_value=10, max_value=60, value=15)
-if st.session_state.live_mode:
-    st_autorefresh(interval=refresh_rate * 1000, limit=None, key="live_data_refresh")
-
-taker_fee_input = st.sidebar.number_input("Taker Fee (%)", value=0.05, step=0.01) / 100
-leverage_input = st.sidebar.number_input("ম্যাক্স লিভারেজ", value=50, step=10)
-max_open_trades = st.sidebar.number_input("ম্যাক্স ট্রেড লিমিট", value=2, min_value=1, max_value=4)
-max_daily_loss = st.sidebar.number_input("ডেইলি লস লিমিট", value=100.0, step=10.0)
-cooldown_mins = st.sidebar.number_input("কুলডাউন (মিনিট)", value=15, step=5)
-
-STARTING_BALANCE = 1000.0
-current_bal = st.session_state.balance
-DYNAMIC_RISK_PCT = 0.01 if current_bal >= STARTING_BALANCE else max(0.01 * (current_bal / STARTING_BALANCE), 0.002) 
-DYNAMIC_RISK_INR = current_bal * DYNAMIC_RISK_PCT
-MAX_MARGIN_PER_TRADE = current_bal * 0.15 
-circuit_breaker_active = st.session_state.daily_pnl <= -max_daily_loss
-
-if st.sidebar.button("🔄 ডাটাবেস রিসেট করুন"):
-    with sqlite3.connect(DB_FILE, timeout=30) as conn:
-        conn.cursor().execute("DELETE FROM trades")
-        conn.commit()
-    st.session_state.balance = STARTING_BALANCE
-    st.session_state.total_fees = 0.0
-    st.session_state.live_mode = False
-    st.session_state.open_trades = {}
-    st.session_state.pending_orders = {}
-    st.session_state.cooldowns = {}
-    st.session_state.daily_pnl = 0.0
-    st.session_state.date_tracker = str(datetime.now(timezone.utc).date())
-    st.session_state.trade_history_df = pd.DataFrame()
-    save_data()
-    st.rerun()
-
-# ================= ⚡ 4. INDICATORS & MARKET DATA =================
-def fetch_historical_data(symbol, tf, limit):
-    local_exch = ccxt.kucoin({'enableRateLimit': True, 'timeout': 5000})
-    data = None
-    for i in range(3):
-        try: 
-            data = local_exch.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            break
-        except Exception as e:
-            if i == 2: logging.error(f"API Error {symbol} ({tf}): {e}")
-            time.sleep(1) 
-    del local_exch # 🔥 RAM ক্লিয়ার
-    return data
-
-def fetch_live_ticker(symbol):
-    local_exch = ccxt.kucoin({'enableRateLimit': True, 'timeout': 5000})
-    ticker_data = None
-    try: 
-        ticker = local_exch.fetch_ticker(symbol)
-        ticker_data = {'bid': ticker['bid'], 'ask': ticker['ask'], 'last': ticker['last']}
-    except: pass
-    del local_exch # 🔥 RAM ক্লিয়ার
-    return ticker_data
-
-def rma(x, n):
-    a = 1 / n
-    return x.ewm(alpha=a, adjust=False).mean()
-
-def calculate_indicators(df):
-    delta = df['close'].diff()
-    gain, loss = delta.clip(lower=0), -1 * delta.clip(upper=0)
-    avg_gain, avg_loss = rma(gain, 14), rma(loss, 14)
-    rs = avg_gain / (avg_loss + 1e-10)
-    df['rsi'] = np.where(avg_loss == 0, 100, 100 - (100 / (1 + rs))) 
-    
-    high, low, prev_close = df['high'], df['low'], df['close'].shift(1)
-    tr = pd.Series(np.maximum.reduce([high - low, np.abs(high - prev_close), np.abs(low - prev_close)]), index=df.index)
-    df['atr'] = rma(tr, 14)
-    
-    up, down = high.diff(), -low.diff()
-    pos_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    neg_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    
-    df['+di'] = 100 * (rma(pos_dm, 14) / (df['atr'] + 1e-10))
-    df['-di'] = 100 * (rma(neg_dm, 14) / (df['atr'] + 1e-10))
-    dx = 100 * np.abs(df['+di'] - df['-di']) / (df['+di'] + df['-di'] + 1e-10)
-    df['adx'] = rma(dx, 14)
-    return df
-
-def analyze_market(coin):
+def fetch_data(symbol, timeframe, limit=250):
+    exchange = get_exchange()
     try:
-        current_utc_hour = datetime.now(timezone.utc).hour
-        in_session = (7 <= current_utc_hour <= 22)
-            
-        bars_1h = fetch_historical_data(coin, '1h', 260) 
-        if not bars_1h or len(bars_1h) < 220: return None 
-        df_1h = pd.DataFrame(bars_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        ema20, ema50, ema200 = df_1h['close'].ewm(span=20, adjust=False).mean(), df_1h['close'].ewm(span=50, adjust=False).mean(), df_1h['close'].ewm(span=200, adjust=False).mean()
-        bias_bullish = (ema20.iloc[-2] > ema50.iloc[-2] > ema200.iloc[-2]) and (ema20.iloc[-2] > ema20.iloc[-7])
-        bias_bearish = (ema20.iloc[-2] < ema50.iloc[-2] < ema200.iloc[-2]) and (ema20.iloc[-2] < ema20.iloc[-7])
-
-        bars_15m = fetch_historical_data(coin, '15m', 100)
-        if not bars_15m: return None 
-        df_15m = pd.DataFrame(bars_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_15m['pivot_high'] = (df_15m['high'] > df_15m['high'].shift(1)) & (df_15m['high'] > df_15m['high'].shift(2)) & (df_15m['high'] > df_15m['high'].shift(-1)) & (df_15m['high'] > df_15m['high'].shift(-2))
-        df_15m['pivot_low'] = (df_15m['low'] < df_15m['low'].shift(1)) & (df_15m['low'] < df_15m['low'].shift(2)) & (df_15m['low'] < df_15m['low'].shift(-1)) & (df_15m['low'] < df_15m['low'].shift(-2))
-        last_highs, last_lows = df_15m[df_15m['pivot_high']]['high'].dropna().values, df_15m[df_15m['pivot_low']]['low'].dropna().values
-        
-        struct_bullish = len(last_highs) >= 2 and last_highs[-1] > last_highs[-2]
-        struct_bearish = len(last_lows) >= 2 and last_lows[-1] < last_lows[-2]
-
-        bars_5m = fetch_historical_data(coin, '5m', 100)
-        if not bars_5m: return None
-        df = pd.DataFrame(bars_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
-        
-        atr_val = df['atr'].iloc[-2]
-        if atr_val <= 0: return None 
-        
-        c2, c3, c4 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
-        closed_price = c2['close']
-        
-        swing_high_30, swing_low_30 = df['high'].rolling(30).max().iloc[-2], df['low'].rolling(30).min().iloc[-2]
-        equilibrium = (swing_high_30 + swing_low_30) / 2
-        
-        ticker = fetch_live_ticker(coin)
-        if not ticker: return None
-        
-        signal, tags = "NORMAL", ""
-        limit_entry_price = ticker['last']
-        
-        if in_session and not circuit_breaker_active:
-            is_vol_spike = c2['volume'] > (df['volume'].rolling(20).mean().iloc[-2] * 1.5)
-            bullish_disp, bearish_disp = (c2['close'] - c2['open']) > (atr_val * 0.8), (c2['open'] - c2['close']) > (atr_val * 0.8)
-            choch_bullish, choch_bearish = c2['close'] > df['high'].iloc[-10:-2].max(), c2['close'] < df['low'].iloc[-10:-2].min()
-            
-            has_bullish_fvg = df['low'].iloc[-2] > c4['high']
-            has_bearish_fvg = df['high'].iloc[-2] < c4['low']
-            
-            has_real_bullish_ob = (c3['close'] < c3['open']) and bullish_disp and is_vol_spike and choch_bullish and has_bullish_fvg
-            has_real_bearish_ob = (c3['close'] > c3['open']) and bearish_disp and is_vol_spike and choch_bearish and has_bearish_fvg
-
-            mom_bullish, mom_bearish = (df['rsi'].iloc[-2] > 55 and df['adx'].iloc[-2] > 20), (df['rsi'].iloc[-2] < 45 and df['adx'].iloc[-2] > 20)
-
-            if has_real_bullish_ob and struct_bullish and bias_bullish and mom_bullish and (closed_price < equilibrium): 
-                signal, limit_entry_price, tags = "BUY", c3['high'], "SMC: CHoCH+FVG+OB (Discount)"
-            elif has_real_bearish_ob and struct_bearish and bias_bearish and mom_bearish and (closed_price > equilibrium): 
-                signal, limit_entry_price, tags = "SELL", c3['low'], "SMC: CHoCH+FVG+OB (Premium)"
-
-        # 🔥 Dataframe RAM ক্লিয়ার
-        del df_1h, df_15m, df
-        
-        return {'limit_entry': round(limit_entry_price, 6), 'ticker': ticker, 'candle_high': df['high'].iloc[-1] if 'df' in locals() else c2['high'], 'candle_low': df['low'].iloc[-1] if 'df' in locals() else c2['low'], 'signal': signal, 'tags': tags, 'atr': round(atr_val, 6), 'sweep_low': round(swing_low_30, 6), 'sweep_high': round(swing_high_30, 6)}
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        return df
     except Exception as e:
-        logging.error(f"Analysis Error {coin}: {e}")
         return None
 
-all_data = {}
-with ThreadPoolExecutor(max_workers=2) as executor:
-    future_to_coin = {executor.submit(analyze_market, coin): coin for coin in SCALPING_COINS}
-    for future in as_completed(future_to_coin):
-        coin = future_to_coin[future]
-        try: all_data[coin] = future.result()
-        except: pass
+# ================= 🧮 2026 AI SCORING ENGINE =================
+def rma(x, n):
+    return x.ewm(alpha=1/n, adjust=False).mean()
 
-# ================= 🤖 5. SMART STATE MACHINE & EXECUTION =================
-def check_exposure_limit(new_type):
-    same_dir_count = sum(1 for t in st.session_state.open_trades.values() if t['type'] == new_type)
-    same_dir_count += sum(1 for p in st.session_state.pending_orders.values() if p['type'] == new_type)
-    return same_dir_count < 2
-
-def place_pending_order(coin, data, trade_type):
-    if len(st.session_state.open_trades) + len(st.session_state.pending_orders) >= max_open_trades: return False
-    if not check_exposure_limit(trade_type): return False
-    if coin in st.session_state.cooldowns and (int(time.time()) - st.session_state.cooldowns[coin]) < (cooldown_mins * 60): return False
+def process_market_data(coin):
+    df_1h = fetch_data(coin, '1h')
+    df_15m = fetch_data(coin, '15m')
+    df_5m = fetch_data(coin, '5m')
     
-    st.session_state.pending_orders[coin] = {
-        'id': str(uuid.uuid4()), 'coin': coin, 'type': trade_type, 
-        'limit_price': data['limit_entry'], 'atr': data['atr'],
-        'sweep_low': data['sweep_low'], 'sweep_high': data['sweep_high'],
-        'tags': data['tags'], 
-        'time_str': datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
-        'timestamp': int(time.time()) 
-    }
-    return True
-
-def fill_order(coin, pending_order, ticker, max_lev):
-    trade_type = pending_order['type']
-    entry = min(pending_order['limit_price'], ticker['ask']) if trade_type == 'BUY' else max(pending_order['limit_price'], ticker['bid'])
-    entry = round(entry, 6)
-    
-    atr = pending_order['atr']
-    sl = min(pending_order['sweep_low'] - (atr * 0.2), entry - (atr * 1.5)) if trade_type == 'BUY' else max(pending_order['sweep_high'] + (atr * 0.2), entry + (atr * 1.5))
-    sl = round(sl, 6)
-    sl_dist = abs(entry - sl)
-    
-    liq_distance = entry * (1 / max_lev)
-    applied_leverage = max_lev
-    if sl_dist > (liq_distance * 0.85): 
-        safe_leverage = int((entry * 0.85) / sl_dist)
-        applied_leverage = max(1, min(safe_leverage, max_lev))
+    if df_1h is None or df_15m is None or df_5m is None:
+        return None
         
-    sl_pct = max(sl_dist / entry, 0.003) 
-    ideal_size = DYNAMIC_RISK_INR / sl_pct
-    avail = st.session_state.balance - sum(t.get('margin', 0) for t in st.session_state.open_trades.values())
-    pos_size = min(ideal_size, avail * applied_leverage, MAX_MARGIN_PER_TRADE * applied_leverage)
+    # 1H Structure
+    df_1h['swing_high_20'] = df_1h['high'].rolling(20).max()
+    df_1h['swing_low_20'] = df_1h['low'].rolling(20).min()
+    df_1h['1h_bull_struct'] = df_1h['close'] > df_1h['swing_high_20'].shift(1)
+    df_1h['1h_bear_struct'] = df_1h['close'] < df_1h['swing_low_20'].shift(1)
     
-    margin, pos_size = round(pos_size / applied_leverage, 6), round(pos_size, 6)
-    fee = round(pos_size * taker_fee_input, 6)
+    # 15M Trend Bias
+    df_15m['ema50_15m'] = df_15m['close'].ewm(span=50).mean()
+    df_15m['15m_bull'] = df_15m['close'] > df_15m['ema50_15m']
+    df_15m['15m_bear'] = df_15m['close'] < df_15m['ema50_15m']
     
-    if avail <= (fee + margin): 
-        del st.session_state.pending_orders[coin]; return True 
+    df = pd.merge_asof(df_5m, df_15m[['datetime', '15m_bull', '15m_bear']], on='datetime', direction='backward')
+    df = pd.merge_asof(df, df_1h[['datetime', '1h_bull_struct', '1h_bear_struct']], on='datetime', direction='backward')
+    
+    df['atr'] = rma(pd.Series(np.maximum.reduce([df['high'] - df['low'], np.abs(df['high'] - df['close'].shift(1)), np.abs(df['low'] - df['close'].shift(1))])), 14)
+    df['atr_pct'] = df['atr'].rolling(200).rank(pct=True)
+    df['bb_width'] = (df['high'].rolling(20).max() - df['low'].rolling(20).min()) / df['close']
+    df['regime_trend'] = (df['bb_width'].shift(1) > df['bb_width'].rolling(50).mean().shift(1))
+    
+    df['eqh'] = abs(df['high'] - df['high'].shift(1)) < (df['atr'] * 0.1)
+    df['eql'] = abs(df['low'] - df['low'].shift(1)) < (df['atr'] * 0.1)
+    df['swing_high_10'] = df['high'].rolling(10).max().shift(1)
+    df['swing_low_10'] = df['low'].rolling(10).min().shift(1)
+    df['candle_delta'] = np.where(df['close'] > df['open'], df['volume'], -df['volume'])
+    df['delta_ema'] = df['candle_delta'].ewm(span=10).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
+    df['datetime_ist'] = df['datetime'] + pd.Timedelta(hours=5, minutes=30)
+    
+    return df
+
+def generate_signals(all_data):
+    signals = []
+    btc_df = all_data.get('BTC/USDT')
+    btc_bull, btc_bear = False, False
+    if btc_df is not None:
+        btc_bull = btc_df['close'].iloc[-2] > btc_df['ema50'].iloc[-2]
+        btc_bear = btc_df['close'].iloc[-2] < btc_df['ema50'].iloc[-2]
+
+    for coin, df in all_data.items():
+        if df is None or len(df) < 5: continue
         
-    st.session_state.balance -= fee
-    st.session_state.total_fees += fee
-    
-    st.session_state.open_trades[coin] = {
-        'id': pending_order['id'], 'coin': coin, 'type': trade_type, 
-        'entry_price': entry, 'sl': sl, 'initial_sl': sl, 
-        'highest_price': entry, 'lowest_price': entry,
-        'initial_size': pos_size, 'size_inr': pos_size, 'margin': margin, 'leverage': applied_leverage,
-        'initial_risk_inr': round(max(pos_size * sl_pct, 0.01), 6),
-        'tags': pending_order['tags'],
-        'stage': 0, 'realized_pnl': 0.0, 'realized_fee': fee, 
-        'time_str': datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    }
-    del st.session_state.pending_orders[coin]
-    return True
-
-def execute_partial(t, live_p, pct_to_close, new_stage):
-    close_size = round(t['initial_size'] * pct_to_close, 6) if new_stage < 2 else t['size_inr']
-    gross_pnl = ((live_p - t['entry_price']) / t['entry_price'] * close_size) if t['type'] == 'BUY' else ((t['entry_price'] - live_p) / t['entry_price'] * close_size)
-    exit_fee = round(close_size * taker_fee_input, 6)
-    net_pnl = round(gross_pnl - exit_fee, 6)
-    
-    st.session_state.balance += net_pnl
-    st.session_state.total_fees += exit_fee
-    st.session_state.daily_pnl += net_pnl
-    
-    t['realized_pnl'] = round(t['realized_pnl'] + net_pnl, 6)
-    t['realized_fee'] = round(t['realized_fee'] + exit_fee, 6)
-    t['size_inr'] = round(t['size_inr'] - close_size, 6)
-    t['margin'] = round(t['size_inr'] / t['leverage'], 6)
-    t['stage'] = new_stage
-    return t
-
-def close_full_trade(coin, live_p, reason):
-    t = st.session_state.open_trades[coin]
-    close_size = t['size_inr']
-    gross_pnl = ((live_p - t['entry_price']) / t['entry_price'] * close_size) if t['type'] == 'BUY' else ((t['entry_price'] - live_p) / t['entry_price'] * close_size)
-    exit_fee = round(close_size * taker_fee_input, 6)
-    net_pnl = round(gross_pnl - exit_fee, 6)
-    
-    st.session_state.balance += net_pnl
-    st.session_state.total_fees += exit_fee
-    st.session_state.daily_pnl += net_pnl
-    t['realized_pnl'] = round(t['realized_pnl'] + net_pnl, 6)
-    t['realized_fee'] = round(t['realized_fee'] + exit_fee, 6)
-    
-    log_trade_db(t['id'], int(time.time()), t['time_str'], coin, t['type'], t['tags'], reason, t['realized_pnl'], t['realized_fee'], t['initial_risk_inr'])
-    st.session_state.cooldowns[coin] = int(time.time())
-    del st.session_state.open_trades[coin]
-    return True
-
-if circuit_breaker_active and len(st.session_state.open_trades) > 0:
-    global_db_dirty = False
-    for coin in list(st.session_state.open_trades.keys()):
-        ticker = fetch_live_ticker(coin)
-        live_p = ticker['bid'] if st.session_state.open_trades[coin]['type'] == 'BUY' else ticker['ask']
-        if live_p:
-            close_full_trade(coin, live_p, 'Circuit Breaker 🛑')
-            global_db_dirty = True
-    if st.session_state.pending_orders: st.session_state.pending_orders.clear(); global_db_dirty = True
-    if global_db_dirty: save_data()
-    st.sidebar.error(f"🛑 ইমার্জেন্সি: সার্কিট ব্রেকার হিট করায় সব ট্রেড ক্লোজ করা হয়েছে!")
-
-elif st.session_state.live_mode and not circuit_breaker_active:
-    global_db_dirty = False 
-    
-    for coin, p_order in list(st.session_state.pending_orders.items()):
-        if coin in all_data and all_data[coin]:
-            d, ticker = all_data[coin], all_data[coin]['ticker']
-            limit_p = p_order['limit_price']
-            if (p_order['type'] == 'BUY' and ticker['ask'] <= limit_p) or (p_order['type'] == 'SELL' and ticker['bid'] >= limit_p):
-                if fill_order(coin, p_order, ticker, leverage_input): global_db_dirty = True
-            elif (int(time.time()) - p_order['timestamp']) > 3600: 
-                del st.session_state.pending_orders[coin]; global_db_dirty = True
-
-    for coin, t in list(st.session_state.open_trades.items()):
-        if coin in all_data and all_data[coin]:
-            d, ticker, new_signal = all_data[coin], all_data[coin]['ticker'], all_data[coin]['signal']
-            live_p = ticker['bid'] if t['type'] == 'BUY' else ticker['ask'] 
-            c_high, c_low = d['candle_high'], d['candle_low']
-            risk = abs(t['entry_price'] - t['initial_sl'])
-            
-            vol_pct = (d['atr'] / live_p) * 100
-            trail_mult = 1.2 if vol_pct < 0.3 else (1.8 if vol_pct < 0.8 else 2.8)
-            
-            if (t['type'] == 'BUY' and new_signal == 'SELL') or (t['type'] == 'SELL' and new_signal == 'BUY'):
-                if close_full_trade(coin, live_p, 'Opposite Signal 🔄'): global_db_dirty = True
-                continue
-            
-            if t['type'] == 'BUY':
-                if c_high > t['highest_price']: t['highest_price'] = c_high; global_db_dirty = True
-                if t['stage'] == 0 and live_p >= (t['entry_price'] + risk):
-                    t = execute_partial(t, live_p, 0.3, 1)
-                    t['sl'] = max(t['sl'], t['entry_price'] * (1 + (taker_fee_input * 2))); st.session_state.open_trades[coin] = t; global_db_dirty = True
-                elif t['stage'] == 1 and live_p >= (t['entry_price'] + (risk * 2)):
-                    t = execute_partial(t, live_p, 0.3, 2); st.session_state.open_trades[coin] = t; global_db_dirty = True
-                
-                if t['stage'] > 0:
-                    new_sl = max(t['sl'], t['highest_price'] - (d['atr'] * trail_mult))
-                    if new_sl > t['sl']: t['sl'] = new_sl; st.session_state.open_trades[coin] = t; global_db_dirty = True
-                    
-                if live_p <= t['sl']:
-                    if close_full_trade(coin, live_p, 'Trailing SL 🛡️' if t['sl'] > t['entry_price'] else 'SL Hit 🛑'): global_db_dirty = True
-                    continue
-            else: # SELL
-                if c_low < t['lowest_price']: t['lowest_price'] = c_low; global_db_dirty = True
-                if t['stage'] == 0 and live_p <= (t['entry_price'] - risk):
-                    t = execute_partial(t, live_p, 0.3, 1)
-                    t['sl'] = min(t['sl'], t['entry_price'] * (1 - (taker_fee_input * 2))); st.session_state.open_trades[coin] = t; global_db_dirty = True
-                elif t['stage'] == 1 and live_p <= (t['entry_price'] - (risk * 2)):
-                    t = execute_partial(t, live_p, 0.3, 2); st.session_state.open_trades[coin] = t; global_db_dirty = True
-                
-                if t['stage'] > 0:
-                    new_sl = min(t['sl'], t['lowest_price'] + (d['atr'] * trail_mult))
-                    if new_sl < t['sl']: t['sl'] = new_sl; st.session_state.open_trades[coin] = t; global_db_dirty = True
-                
-                if live_p >= t['sl']:
-                    if close_full_trade(coin, live_p, 'Trailing SL 🛡️' if t['sl'] < t['entry_price'] else 'SL Hit 🛑'): global_db_dirty = True
-                    continue
-                    
-    for coin, data in all_data.items():
-        if data and data['signal'] in ["BUY", "SELL"] and coin not in st.session_state.open_trades and coin not in st.session_state.pending_orders:
-            if place_pending_order(coin, data, data['signal']): global_db_dirty = True
-            
-    if global_db_dirty: save_data() 
-
-# ================= 📊 6. QUANT ANALYTICS DASHBOARD =================
-st.markdown("<h3 style='color:#00FFCC;'>📊 2026 কোয়ান্ট ড্যাশবোর্ড (v37)</h3>", unsafe_allow_html=True)
-tc1, tc2 = st.columns([1, 4])
-with tc1: st.toggle("🔴 অটো ট্রেডিং অন/অফ", key='live_mode', on_change=save_data)
-
-df_hist = st.session_state.trade_history_df
-total_trades = len(df_hist)
-wins = len(df_hist[df_hist['pnl'] > 0]) if total_trades > 0 else 0
-win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0.0
-
-gross_profit = df_hist[df_hist['pnl'] > 0]['pnl'].sum() if total_trades > 0 else 0
-gross_loss = abs(df_hist[df_hist['pnl'] <= 0]['pnl'].sum()) if total_trades > 0 else 0
-profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('nan') if gross_loss == 0 and gross_profit == 0 else float('inf')) 
-
-max_dd, expectancy = 0.0, 0.0
-if not df_hist.empty:
-    temp_df = df_hist.sort_values(by='timestamp', ascending=True)
-    equity_curve = 1000.0 + temp_df['pnl'].cumsum()
-    max_dd = (equity_curve.cummax() - equity_curve).max()
-    df_hist['risk'] = df_hist['risk'].clip(lower=0.01)
-    df_hist['R_Multiple'] = df_hist['pnl'] / df_hist['risk']
-    expectancy = df_hist['R_Multiple'].mean()
-
-total_profit = st.session_state.balance - 1000.0
-
-c1, c2, c3, c4 = st.columns(4)
-with c1: st.markdown(f"<div class='dash-card'><div class='stat-title'>অ্যাভেইলেবল ব্যালেন্স</div><b style='font-size:22px;'>₹{st.session_state.balance:.2f}</b></div>", unsafe_allow_html=True)
-with c2: st.markdown(f"<div class='dash-card'><div class='stat-title'>নিট লাভ/ক্ষতি</div><b style='font-size:22px; color:{'#00FF00' if total_profit>=0 else '#FF1744'};'>₹{total_profit:.2f}</b></div>", unsafe_allow_html=True)
-with c3: st.markdown(f"<div class='dash-card'><div class='stat-title'>ডেইলি PnL (UTC)</div><b style='font-size:22px; color:{'#00FF00' if st.session_state.daily_pnl>=0 else '#FF1744'};'>₹{st.session_state.daily_pnl:.2f}</b></div>", unsafe_allow_html=True)
-with c4: st.markdown(f"<div class='dash-card'><div class='stat-title'>Max Drawdown</div><b style='font-size:22px; color:#FF1744;'>₹{max_dd:.2f}</b></div>", unsafe_allow_html=True)
-
-s1, s2, s3, s4 = st.columns(4)
-with s1: st.markdown(f"<div class='stat-card'><div class='stat-title'>উইন রেট</div><b style='font-size:18px; color:#00FF00;'>{win_rate:.1f}%</b></div>", unsafe_allow_html=True)
-with s2: st.markdown(f"<div class='stat-card'><div class='stat-title'>প্রফিট ফ্যাক্টর</div><b style='font-size:18px; color:#FCD535;'>{'∞' if profit_factor == float('inf') else f'{profit_factor:.2f}'}</b></div>", unsafe_allow_html=True)
-with s3: st.markdown(f"<div class='stat-card'><div class='stat-title'>Expectancy (R)</div><b style='font-size:18px; color:#00FFCC;'>{expectancy:.2f} R</b></div>", unsafe_allow_html=True)
-with s4: st.markdown(f"<div class='stat-card'><div class='stat-title'>মোট ট্রেড</div><b style='font-size:18px;'>{total_trades}</b></div>", unsafe_allow_html=True)
-
-# ================= 🟢 7. ACTIVE & PENDING TRADES =================
-st.markdown("<h4>⚡ পেন্ডিং ও চলমান ট্রেডসমূহ</h4>", unsafe_allow_html=True)
-if len(st.session_state.pending_orders) > 0:
-    for coin, p in st.session_state.pending_orders.items():
-        st.markdown(f"<div class='pending-trade'><b>{coin} ({p['type']})</b> | 🕒 PENDING (Limit)<br>📍 লিমিট: {p['limit_price']:.4f} | 🏷️ ট্যাগ: {p['tags']}</div>", unsafe_allow_html=True)
-
-if len(st.session_state.open_trades) > 0:
-    for coin, t in st.session_state.open_trades.items():
-        ticker = all_data.get(coin, {}).get('ticker', {}) if coin in all_data else {}
-        live_p = ticker.get('bid', t['entry_price']) if t['type'] == 'BUY' else ticker.get('ask', t['entry_price'])
-        live_pnl = (((live_p - t['entry_price']) / t['entry_price']) * t['size_inr']) if t['type'] == 'BUY' else (((t['entry_price'] - live_p) / t['entry_price']) * t['size_inr'])
-        total_running_pnl = t['realized_pnl'] + live_pnl
-        lp_color = "#00FF00" if total_running_pnl > 0 else "#FF1744"
-        stages = ["⏳ Wait for 1R", "🚀 30% Booked", "🔥 60% Booked (Runner)"]
+        c2 = df.iloc[-2] # Last closed candle
+        c4 = df.iloc[-4]
+        live_candle = df.iloc[-1] # Active current candle
         
-        html = (f"<div class='active-trade'>"
-                f"<b>{coin} ({t['type']})</b> | {stages[t['stage']]} <br>"
-                f"📍 এন্ট্রি: {t['entry_price']:.4f} | ⚡ লাইভ: {live_p:.4f} | 🛑 SL: {t['sl']:.4f} (Lev: {t['leverage']}x)<br>"
-                f"💼 <b>রানিং সাইজ:</b> ₹{t['size_inr']:.2f} | 💸 PnL: <b style='color:{lp_color};'>₹{total_running_pnl:.2f}</b><br>"
-                f"🏷️ <i>{t['tags']}</i></div>")
-        st.markdown(html, unsafe_allow_html=True)
+        bull_liquidity_grab = (c2['low'] < c2['swing_low_10']) and df['eql'].iloc[-4]
+        bear_liquidity_grab = (c2['high'] > c2['swing_high_10']) and df['eqh'].iloc[-4]
+        has_bull_fvg = (c2['low'] > c4['high']) and ((c2['low'] - c4['high']) > (c2['atr'] * 0.15))
+        has_bear_fvg = (c4['low'] > c2['high']) and ((c4['low'] - c2['high']) > (c2['atr'] * 0.15))
+        
+        bull_orderflow = c2['delta_ema'] > 0
+        bear_orderflow = c2['delta_ema'] < 0
+        
+        hour = c2['datetime_ist'].hour
+        aggressive_session = hour in [12, 13, 14, 18, 19, 20]
+        good_volatility = 0.40 <= c2['atr_pct'] <= 0.85
+        
+        wick_ratio_bull = (c2['high'] - c2['close']) / (c2['high'] - c2['low'] + 1e-10)
+        wick_ratio_bear = (c2['close'] - c2['low']) / (c2['high'] - c2['low'] + 1e-10)
+        mm_trap_bull = (c2['low'] < c2['swing_low_10']) and (wick_ratio_bull > 0.6) and (c2['close'] > c2['open'])
+        mm_trap_bear = (c2['high'] > c2['swing_high_10']) and (wick_ratio_bear > 0.6) and (c2['close'] < c2['open'])
 
-if not st.session_state.pending_orders and not st.session_state.open_trades:
-    st.info("এই মুহূর্তে কোনো ওপেন বা পেন্ডিং ট্রেড নেই। বট সিগন্যালের জন্য অপেক্ষা করছে...")
+        bull_score, bear_score = 0, 0
+        
+        if c2.get('1h_bull_struct', False): bull_score += 20
+        if c2.get('15m_bull', False): bull_score += 15
+        if bull_liquidity_grab: bull_score += 15
+        if has_bull_fvg: bull_score += 15
+        if bull_orderflow: bull_score += 15
+        if aggressive_session: bull_score += 10
+        if good_volatility and c2['regime_trend']: bull_score += 10
+        if mm_trap_bull: bull_score += 15
+        if coin != 'BTC/USDT' and btc_bull: bull_score += 10
+        
+        if c2.get('1h_bear_struct', False): bear_score += 20
+        if c2.get('15m_bear', False): bear_score += 15
+        if bear_liquidity_grab: bear_score += 15
+        if has_bear_fvg: bear_score += 15
+        if bear_orderflow: bear_score += 15
+        if aggressive_session: bear_score += 10
+        if good_volatility and c2['regime_trend']: bear_score += 10
+        if mm_trap_bear: bear_score += 15
+        if coin != 'BTC/USDT' and btc_bear: bear_score += 10
 
-st.markdown("<h4>📜 ট্রেড হিস্টোরি (Journal)</h4>", unsafe_allow_html=True)
-if not df_hist.empty: 
-    display_df = df_hist.drop(columns=['risk', 'R_Multiple', 'timestamp'], errors='ignore') 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+        exec_score = max(bull_score, bear_score)
+        direction = "WAIT"
+        confidence = "LOW"
+        entry, sl, tp = 0.0, 0.0, 0.0
+        
+        raw_direction = "BUY" if bull_score > bear_score else "SELL"
+        
+        # ✅ v56 Live Candle Body Confirmation Filter
+        candle_confirmed = False
+        if raw_direction == "BUY" and live_candle['close'] > live_candle['open']:
+            candle_confirmed = True
+        elif raw_direction == "SELL" and live_candle['close'] < live_candle['open']:
+            candle_confirmed = True
 
-# 🔥 RAM ক্লিয়ার করার কমান্ড (ক্র্যাশ বা ফ্রিজ এড়াতে)
-gc.collect()
+        if exec_score >= EXECUTION_THRESHOLD and candle_confirmed:
+            direction = raw_direction
+            confidence = "HIGH" if exec_score >= 85 else "MEDIUM"
+            
+            sl_dist = c2['atr'] * 1.5
+            variable_slippage = c2['atr'] * 0.03
+            
+            if direction == "BUY":
+                entry = live_candle['close'] + variable_slippage
+                sl = entry - sl_dist
+                tp = entry + (sl_dist * TARGET_RR)
+            else:
+                entry = live_candle['close'] - variable_slippage
+                sl = entry + sl_dist
+                tp = entry - (sl_dist * TARGET_RR)
+
+        signals.append({
+            'coin': coin, 'direction': direction, 'score': exec_score, 'confidence': confidence,
+            'entry': round(entry, 4) if entry > 0 else "-", 'sl': round(sl, 4) if sl > 0 else "-",
+            'tp': round(tp, 4) if tp > 0 else "-", 'time': live_candle['datetime_ist'].strftime('%Y-%m-%d %H:%M:%S'),
+            'price': round(live_candle['close'], 4)
+        })
+    return signals
+
+# ================= 🚀 TELEGRAM (WITH FULL TIMESTAMP UNIQUE KEY) =================
+def send_telegram_alert(sig):
+    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        return
+        
+    # ✅ v56 Precise Unique Key per specific 5M candle timestamp
+    signal_key = f"{sig['coin']}_{sig['direction']}_{sig['time']}"
+    
+    if signal_key != st.session_state['last_sent_signal']:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        msg = f"⚡ *V56 INSTITUTIONAL ALERT*\n\n🪙 *Asset:* {sig['coin']}\n🟢 *Action:* {sig['direction']}\n🎯 *AI Score:* {sig['score']} ({sig['confidence']})\n\n💵 *Entry:* {sig['entry']}\n🛑 *SL:* {sig['sl']}\n🚀 *TP:* {sig['tp']}\n⏱ *Time:* {sig['time']}"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        try:
+            requests.post(url, data=payload)
+            st.session_state['last_sent_signal'] = signal_key
+        except Exception as e:
+            pass
+
+# ================= 🖥️ STREAMLIT UI =================
+st.title("⚡ Prime Samaresh Live Terminal (v56)")
+st.caption("24/7 Operational Terminal with Candle Confirmation & Precise Alert Deduplication")
+st.markdown("---")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Mode", "Live Operational", "Auto-refresh Active")
+col2.metric("Threshold", "75+ AI Score", "Strict Filter Active")
+col3.metric("Status", "Connected", "Binance Futures API")
+
+with st.spinner("Scanning live market orderflow & strict confirmation rules..."):
+    all_live_data = {coin: process_market_data(coin) for coin in COINS}
+    live_signals = generate_signals(all_live_data)
+    
+    st.subheader("📡 Validated Live Signals")
+    
+    for sig in live_signals:
+        if sig['direction'] == "BUY":
+            st.markdown(f"""
+            <div class="signal-buy">
+                <h3>🟢 {sig['coin']} - BUY SIGNAL</h3>
+                <b>AI Score:</b> {sig['score']}/100 ({sig['confidence']} Confidence)<br>
+                <b>Entry:</b> {sig['entry']} | <b>SL:</b> {sig['sl']} | <b>TP:</b> {sig['tp']} @ 2.4R<br>
+                <small>Candle Time: {sig['time']} (IST)</small>
+            </div><br>
+            """, unsafe_allow_html=True)
+            send_telegram_alert(sig)
+            
+        elif sig['direction'] == "SELL":
+            st.markdown(f"""
+            <div class="signal-sell">
+                <h3>🔴 {sig['coin']} - SELL SIGNAL</h3>
+                <b>AI Score:</b> {sig['score']}/100 ({sig['confidence']} Confidence)<br>
+                <b>Entry:</b> {sig['entry']} | <b>SL:</b> {sig['sl']} | <b>TP:</b> {sig['tp']} @ 2.4R<br>
+                <small>Candle Time: {sig['time']} (IST)</small>
+            </div><br>
+            """, unsafe_allow_html=True)
+            send_telegram_alert(sig)
+            
+        else:
+            st.markdown(f"""
+            <div class="signal-wait">
+                <h4>⚪ {sig['coin']} - WAIT</h4>
+                <b>AI Score:</b> {sig['score']}/100 | Market Price: {sig['price']}
+            </div><br>
+            """, unsafe_allow_html=True)
+
+st.markdown("---")
+st.success("✅ **v56 Operational Status:** Full-timestamp telegram key enabled, execution threshold raised to 75, and live candle body direction filter successfully locked.")
+    
