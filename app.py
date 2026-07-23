@@ -7,6 +7,7 @@ import json
 import sqlite3
 import uuid
 import logging
+import gc # 🔥 RAM ক্লিয়ার করার জন্য গার্বেজ কালেক্টর
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
@@ -16,7 +17,7 @@ st.set_page_config(page_title="TRADE MENTOR: APEX QUANT (v37)", layout="wide", i
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 SCALPING_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-DB_FILE = "trading_data_v37.db" # 🔥 New DB for v37 schema
+DB_FILE = "trading_data_v37.db" 
 
 # ================= 🎨 2. PREMIUM CSS =================
 st.markdown("""
@@ -113,7 +114,9 @@ if 'data_loaded' not in st.session_state:
 
 # ================= 🛡️ RISK ENGINE & UI =================
 st.sidebar.markdown("<h3 style='color:#EAECEF;'>⚙️ v37 PRE-PRODUCTION</h3>", unsafe_allow_html=True)
-refresh_rate = st.sidebar.slider("রিফ্রেশ রেট (সেকেন্ড)", min_value=3, max_value=30, value=5)
+
+# 🔥 RAM বাঁচাতে রিফ্রেশ রেট 15s করা হয়েছে
+refresh_rate = st.sidebar.slider("রিফ্রেশ রেট (সেকেন্ড)", min_value=10, max_value=60, value=15)
 if st.session_state.live_mode:
     st_autorefresh(interval=refresh_rate * 1000, limit=None, key="live_data_refresh")
 
@@ -148,20 +151,27 @@ if st.sidebar.button("🔄 ডাটাবেস রিসেট করুন"):
 
 # ================= ⚡ 4. INDICATORS & MARKET DATA =================
 def fetch_historical_data(symbol, tf, limit):
-    local_exch = ccxt.kucoin({'enableRateLimit': True})
+    local_exch = ccxt.kucoin({'enableRateLimit': True, 'timeout': 5000})
+    data = None
     for i in range(3):
-        try: return local_exch.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+        try: 
+            data = local_exch.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+            break
         except Exception as e:
             if i == 2: logging.error(f"API Error {symbol} ({tf}): {e}")
             time.sleep(1) 
-    return None
+    del local_exch # 🔥 RAM ক্লিয়ার
+    return data
 
 def fetch_live_ticker(symbol):
-    local_exch = ccxt.kucoin({'enableRateLimit': True})
+    local_exch = ccxt.kucoin({'enableRateLimit': True, 'timeout': 5000})
+    ticker_data = None
     try: 
         ticker = local_exch.fetch_ticker(symbol)
-        return {'bid': ticker['bid'], 'ask': ticker['ask'], 'last': ticker['last']}
-    except: return None
+        ticker_data = {'bid': ticker['bid'], 'ask': ticker['ask'], 'last': ticker['last']}
+    except: pass
+    del local_exch # 🔥 RAM ক্লিয়ার
+    return ticker_data
 
 def rma(x, n):
     a = 1 / n
@@ -235,7 +245,6 @@ def analyze_market(coin):
             bullish_disp, bearish_disp = (c2['close'] - c2['open']) > (atr_val * 0.8), (c2['open'] - c2['close']) > (atr_val * 0.8)
             choch_bullish, choch_bearish = c2['close'] > df['high'].iloc[-10:-2].max(), c2['close'] < df['low'].iloc[-10:-2].min()
             
-            # 🔥 v37 BUG FIX: No Repaint FVG (Using only closed candles c2 & c4)
             has_bullish_fvg = df['low'].iloc[-2] > c4['high']
             has_bearish_fvg = df['high'].iloc[-2] < c4['low']
             
@@ -249,7 +258,10 @@ def analyze_market(coin):
             elif has_real_bearish_ob and struct_bearish and bias_bearish and mom_bearish and (closed_price > equilibrium): 
                 signal, limit_entry_price, tags = "SELL", c3['low'], "SMC: CHoCH+FVG+OB (Premium)"
 
-        return {'limit_entry': round(limit_entry_price, 6), 'ticker': ticker, 'candle_high': df['high'].iloc[-1], 'candle_low': df['low'].iloc[-1], 'signal': signal, 'tags': tags, 'atr': round(atr_val, 6), 'sweep_low': round(swing_low_30, 6), 'sweep_high': round(swing_high_30, 6)}
+        # 🔥 Dataframe RAM ক্লিয়ার
+        del df_1h, df_15m, df
+        
+        return {'limit_entry': round(limit_entry_price, 6), 'ticker': ticker, 'candle_high': df['high'].iloc[-1] if 'df' in locals() else c2['high'], 'candle_low': df['low'].iloc[-1] if 'df' in locals() else c2['low'], 'signal': signal, 'tags': tags, 'atr': round(atr_val, 6), 'sweep_low': round(swing_low_30, 6), 'sweep_high': round(swing_high_30, 6)}
     except Exception as e:
         logging.error(f"Analysis Error {coin}: {e}")
         return None
@@ -264,7 +276,6 @@ with ThreadPoolExecutor(max_workers=2) as executor:
 
 # ================= 🤖 5. SMART STATE MACHINE & EXECUTION =================
 def check_exposure_limit(new_type):
-    # 🔥 v37 FIX: Exposure/Correlation Filter (Max 2 trades in same direction)
     same_dir_count = sum(1 for t in st.session_state.open_trades.values() if t['type'] == new_type)
     same_dir_count += sum(1 for p in st.session_state.pending_orders.values() if p['type'] == new_type)
     return same_dir_count < 2
@@ -272,14 +283,13 @@ def check_exposure_limit(new_type):
 def place_pending_order(coin, data, trade_type):
     if len(st.session_state.open_trades) + len(st.session_state.pending_orders) >= max_open_trades: return False
     if not check_exposure_limit(trade_type): return False
-    
     if coin in st.session_state.cooldowns and (int(time.time()) - st.session_state.cooldowns[coin]) < (cooldown_mins * 60): return False
     
     st.session_state.pending_orders[coin] = {
         'id': str(uuid.uuid4()), 'coin': coin, 'type': trade_type, 
         'limit_price': data['limit_entry'], 'atr': data['atr'],
         'sweep_low': data['sweep_low'], 'sweep_high': data['sweep_high'],
-        'tags': data['tags'], # Trade Journal Tag
+        'tags': data['tags'], 
         'time_str': datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
         'timestamp': int(time.time()) 
     }
@@ -295,10 +305,9 @@ def fill_order(coin, pending_order, ticker, max_lev):
     sl = round(sl, 6)
     sl_dist = abs(entry - sl)
     
-    # 🔥 v37 FIX: Liquidation Protection & Auto Leverage
     liq_distance = entry * (1 / max_lev)
     applied_leverage = max_lev
-    if sl_dist > (liq_distance * 0.85): # If SL is dangerously close to liquidation
+    if sl_dist > (liq_distance * 0.85): 
         safe_leverage = int((entry * 0.85) / sl_dist)
         applied_leverage = max(1, min(safe_leverage, max_lev))
         
@@ -369,8 +378,9 @@ if circuit_breaker_active and len(st.session_state.open_trades) > 0:
     for coin in list(st.session_state.open_trades.keys()):
         ticker = fetch_live_ticker(coin)
         live_p = ticker['bid'] if st.session_state.open_trades[coin]['type'] == 'BUY' else ticker['ask']
-        close_full_trade(coin, live_p, 'Circuit Breaker 🛑')
-        global_db_dirty = True
+        if live_p:
+            close_full_trade(coin, live_p, 'Circuit Breaker 🛑')
+            global_db_dirty = True
     if st.session_state.pending_orders: st.session_state.pending_orders.clear(); global_db_dirty = True
     if global_db_dirty: save_data()
     st.sidebar.error(f"🛑 ইমার্জেন্সি: সার্কিট ব্রেকার হিট করায় সব ট্রেড ক্লোজ করা হয়েছে!")
@@ -504,3 +514,6 @@ st.markdown("<h4>📜 ট্রেড হিস্টোরি (Journal)</h4>", 
 if not df_hist.empty: 
     display_df = df_hist.drop(columns=['risk', 'R_Multiple', 'timestamp'], errors='ignore') 
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+# 🔥 RAM ক্লিয়ার করার কমান্ড (ক্র্যাশ বা ফ্রিজ এড়াতে)
+gc.collect()
