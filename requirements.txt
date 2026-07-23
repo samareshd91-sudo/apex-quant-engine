@@ -2,4 +2,6 @@ streamlit
 ccxt
 pandas
 numpy
+requests
 streamlit-autorefresh
+tabulate
