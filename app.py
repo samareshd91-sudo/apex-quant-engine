@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
 
 COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
-EXECUTION_THRESHOLD = 75  # ✅ Institutional strictness (75+)
+EXECUTION_THRESHOLD = 75  
 TARGET_RR = 2.4
 
 st.set_page_config(page_title="Prime Samaresh Live Terminal v56", layout="wide")
@@ -19,11 +19,9 @@ st.set_page_config(page_title="Prime Samaresh Live Terminal v56", layout="wide")
 # Auto-refresh every 30 seconds for 24/7 Live Monitoring
 st_autorefresh(interval=30000, key="v56_live_refresh")
 
-# Initialize Session State for Unique Telegram Alert Memory
 if 'last_sent_signal' not in st.session_state:
     st.session_state['last_sent_signal'] = ""
 
-# Custom CSS for UI
 st.markdown("""
     <style>
     .signal-buy { background-color: rgba(0,255,170,0.15); padding: 12px; border-radius: 8px; border-left: 6px solid #00FFAA; }
@@ -32,10 +30,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ================= 📡 DATA FETCHING (BINANCE FUTURES) =================
+# ================= 📡 DATA FETCHING (KUCOIN API) =================
 @st.cache_resource
 def get_exchange():
-    return ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+    # ✅ Binance এর বদলে KuCoin ব্যবহার করা হচ্ছে (ক্লাউড ব্লকিং এড়ানোর জন্য)
+    return ccxt.kucoin({'enableRateLimit': True})
 
 def fetch_data(symbol, timeframe, limit=250):
     exchange = get_exchange()
@@ -59,13 +58,11 @@ def process_market_data(coin):
     if df_1h is None or df_15m is None or df_5m is None:
         return None
         
-    # 1H Structure
     df_1h['swing_high_20'] = df_1h['high'].rolling(20).max()
     df_1h['swing_low_20'] = df_1h['low'].rolling(20).min()
     df_1h['1h_bull_struct'] = df_1h['close'] > df_1h['swing_high_20'].shift(1)
     df_1h['1h_bear_struct'] = df_1h['close'] < df_1h['swing_low_20'].shift(1)
     
-    # 15M Trend Bias
     df_15m['ema50_15m'] = df_15m['close'].ewm(span=50).mean()
     df_15m['15m_bull'] = df_15m['close'] > df_15m['ema50_15m']
     df_15m['15m_bear'] = df_15m['close'] < df_15m['ema50_15m']
@@ -100,9 +97,9 @@ def generate_signals(all_data):
     for coin, df in all_data.items():
         if df is None or len(df) < 5: continue
         
-        c2 = df.iloc[-2] # Last closed candle
+        c2 = df.iloc[-2] 
         c4 = df.iloc[-4]
-        live_candle = df.iloc[-1] # Active current candle
+        live_candle = df.iloc[-1] 
         
         bull_liquidity_grab = (c2['low'] < c2['swing_low_10']) and df['eql'].iloc[-4]
         bear_liquidity_grab = (c2['high'] > c2['swing_high_10']) and df['eqh'].iloc[-4]
@@ -150,7 +147,6 @@ def generate_signals(all_data):
         
         raw_direction = "BUY" if bull_score > bear_score else "SELL"
         
-        # ✅ v56 Live Candle Body Confirmation Filter
         candle_confirmed = False
         if raw_direction == "BUY" and live_candle['close'] > live_candle['open']:
             candle_confirmed = True
@@ -181,12 +177,11 @@ def generate_signals(all_data):
         })
     return signals
 
-# ================= 🚀 TELEGRAM (WITH FULL TIMESTAMP UNIQUE KEY) =================
+# ================= 🚀 TELEGRAM =================
 def send_telegram_alert(sig):
     if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         return
         
-    # ✅ v56 Precise Unique Key per specific 5M candle timestamp
     signal_key = f"{sig['coin']}_{sig['direction']}_{sig['time']}"
     
     if signal_key != st.session_state['last_sent_signal']:
@@ -207,7 +202,9 @@ st.markdown("---")
 col1, col2, col3 = st.columns(3)
 col1.metric("Mode", "Live Operational", "Auto-refresh Active")
 col2.metric("Threshold", "75+ AI Score", "Strict Filter Active")
-col3.metric("Status", "Connected", "Binance Futures API")
+
+# ✅ UI তে Binance এর বদলে KuCoin লেখা দেখানো হচ্ছে
+col3.metric("Status", "Connected", "KuCoin API")
 
 with st.spinner("Scanning live market orderflow & strict confirmation rules..."):
     all_live_data = {coin: process_market_data(coin) for coin in COINS}
@@ -247,5 +244,6 @@ with st.spinner("Scanning live market orderflow & strict confirmation rules...")
             """, unsafe_allow_html=True)
 
 st.markdown("---")
-st.success("✅ **v56 Operational Status:** Full-timestamp telegram key enabled, execution threshold raised to 75, and live candle body direction filter successfully locked.")
-    
+# ✅ Success মেসেজেও KuCoin এর কথা উল্লেখ করা হয়েছে
+st.success("✅ **v56 Operational Status:** KuCoin Data Feed connected, execution threshold 75, and live candle body direction filter successfully locked.")
+        
