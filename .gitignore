@@ -1,0 +1,5 @@
+__pycache__/
+.env
+.streamlit/secrets.toml
+*.pyc
+backtest_data/
