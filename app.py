@@ -5,10 +5,15 @@ import numpy as np
 from datetime import datetime
 import requests
 from streamlit_autorefresh import st_autorefresh
+import logging
 
 # ================= ⚙️ V56 LIVE CONFIGURATION =================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+try:
+    TELEGRAM_BOT_TOKEN = st.secrets["telegram"]["bot_token"]
+    TELEGRAM_CHAT_ID = st.secrets["telegram"]["chat_id"]
+except KeyError:
+    st.error("⚠️ Telegram secrets not found! Please configure .streamlit/secrets.toml")
+    st.stop()
 
 COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 EXECUTION_THRESHOLD = 75  
@@ -179,9 +184,6 @@ def generate_signals(all_data):
 
 # ================= 🚀 TELEGRAM =================
 def send_telegram_alert(sig):
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        return
-        
     signal_key = f"{sig['coin']}_{sig['direction']}_{sig['time']}"
     
     if signal_key != st.session_state['last_sent_signal']:
@@ -189,10 +191,14 @@ def send_telegram_alert(sig):
         msg = f"⚡ *V56 INSTITUTIONAL ALERT*\n\n🪙 *Asset:* {sig['coin']}\n🟢 *Action:* {sig['direction']}\n🎯 *AI Score:* {sig['score']} ({sig['confidence']})\n\n💵 *Entry:* {sig['entry']}\n🛑 *SL:* {sig['sl']}\n🚀 *TP:* {sig['tp']}\n⏱ *Time:* {sig['time']}"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
         try:
-            requests.post(url, data=payload)
+            # Added timeout and good Exception Handling
+            response = requests.post(url, data=payload, timeout=10)
+            response.raise_for_status() # Check for HTTP errors
             st.session_state['last_sent_signal'] = signal_key
         except Exception as e:
-            pass
+            # Logs the error to Streamlit Cloud console and shows a warning on UI
+            logging.error(f"Telegram API Error: {e}")
+            st.warning(f"⚠️ Telegram API Error: {e}")
 
 # ================= 🖥️ STREAMLIT UI =================
 st.title("⚡ Prime Samaresh Live Terminal (v56)")
@@ -246,4 +252,4 @@ with st.spinner("Scanning live market orderflow & strict confirmation rules...")
 st.markdown("---")
 # ✅ Success মেসেজেও KuCoin এর কথা উল্লেখ করা হয়েছে
 st.success("✅ **v56 Operational Status:** KuCoin Data Feed connected, execution threshold 75, and live candle body direction filter successfully locked.")
-        
+    
