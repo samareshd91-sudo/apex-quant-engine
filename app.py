@@ -6,14 +6,21 @@ from datetime import datetime
 import requests
 from streamlit_autorefresh import st_autorefresh
 import logging
+import os  # ✅ Render-এ এনভায়রনমেন্ট ভেরিয়েবল পড়ার জন্য এটি যোগ করা হয়েছে
 
 # ================= ⚙️ V56 LIVE CONFIGURATION =================
-try:
-    TELEGRAM_BOT_TOKEN = st.secrets["telegram"]["bot_token"]
-    TELEGRAM_CHAT_ID = st.secrets["telegram"]["chat_id"]
-except KeyError:
-    st.error("⚠️ Telegram secrets not found! Please configure .streamlit/secrets.toml")
-    st.stop()
+# ✅ Render-এর Environment Variables থেকে ডেটা নেওয়া হচ্ছে
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# যদি Render-এ না পায়, তবে লোকাল পিসির জন্য st.secrets ব্যবহার করবে
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    try:
+        TELEGRAM_BOT_TOKEN = st.secrets["telegram"]["bot_token"]
+        TELEGRAM_CHAT_ID = st.secrets["telegram"]["chat_id"]
+    except Exception:
+        st.error("⚠️ Telegram secrets not found! Please configure Environment Variables on Render.")
+        st.stop()
 
 COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 EXECUTION_THRESHOLD = 75  
@@ -184,6 +191,9 @@ def generate_signals(all_data):
 
 # ================= 🚀 TELEGRAM =================
 def send_telegram_alert(sig):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+        
     signal_key = f"{sig['coin']}_{sig['direction']}_{sig['time']}"
     
     if signal_key != st.session_state['last_sent_signal']:
@@ -252,4 +262,3 @@ with st.spinner("Scanning live market orderflow & strict confirmation rules...")
 st.markdown("---")
 # ✅ Success মেসেজেও KuCoin এর কথা উল্লেখ করা হয়েছে
 st.success("✅ **v56 Operational Status:** KuCoin Data Feed connected, execution threshold 75, and live candle body direction filter successfully locked.")
-    
