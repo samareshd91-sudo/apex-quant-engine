@@ -1,5 +1,28 @@
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Streamlit secrets
 .streamlit/secrets.toml
-*.pyc
-backtest_data/
+
+# Local signal/state files
+sent_signals.json
+sent_signals.json.tmp
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
