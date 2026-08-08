@@ -3,11 +3,10 @@ import streamlit as st
 # ==============================================================================
 # 0. STREAMLIT CONFIG
 # ==============================================================================
-st.set_page_config(page_title="Prime Samaresh Engine v59.1", page_icon="⚙️", layout="centered")
+st.set_page_config(page_title="Prime Samaresh Engine v59.7", page_icon="⚙️", layout="centered")
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import time
 import threading
@@ -18,24 +17,32 @@ import gc
 import psutil
 import uuid
 import hashlib
-import psycopg2
-from datetime import datetime, timedelta
+import random
+from datetime import datetime, timedelta, timezone
 from streamlit_autorefresh import st_autorefresh
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 # ==============================================================================
 # 1. SECRETS & IDENTITY
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-DATABASE_URL = os.environ.get("DATABASE_URL") # Postgres Connection String
+DATABASE_URL = os.environ.get("DATABASE_URL") 
 
 COINS = ['ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 INSTANCE_ID = str(uuid.uuid4())[:8]
-LEASE_DURATION_SEC = 30 # 30 seconds to complete Telegram send
+LEASE_DURATION_SEC = 30 
+MAX_ATTEMPTS = 3 # 1 Initial + 2 Retries
 
 # ==============================================================================
-# 2. GLOBAL LOCKS (SINGLETON)
+# 2. GLOBAL LOCKS & LOGGING
 # ==============================================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 @st.cache_resource
 def get_global_primitives():
     return threading.Lock(), threading.Event()
@@ -43,17 +50,50 @@ def get_global_primitives():
 WORKER_LOCK, STOP_EVENT = get_global_primitives()
 
 # ==============================================================================
-# 3. TRUE ATOMIC EVENT LEDGER & LEASE ARCHITECTURE (Postgres)
+# 3. DATABASE MIGRATION (TIMESTAMPTZ COMPATIBLE)
 # ==============================================================================
-def acquire_distributed_lease(signal_id, symbol, direction, current_time):
-    """v59.1: True Atomic Lock using Postgres ON CONFLICT"""
-    if not DATABASE_URL: return False
-    
-    lease_expires = current_time + LEASE_DURATION_SEC
+def initialize_database():
+    if not DATABASE_URL or psycopg2 is None:
+        logging.error("DATABASE_URL missing. Distributed ledger will NOT work.")
+        return
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                # Attempt to insert new claim OR take over if FAILED/EXPIRED
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS signals_ledger (
+                        signal_id VARCHAR(64) PRIMARY KEY,
+                        symbol VARCHAR(32) NOT NULL,
+                        direction VARCHAR(10) NOT NULL,
+                        status VARCHAR(16) NOT NULL,
+                        claimer VARCHAR(32),
+                        lease_expires TIMESTAMPTZ,
+                        attempts INTEGER NOT NULL DEFAULT 1,
+                        sent_at TIMESTAMPTZ
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_status_expires 
+                    ON signals_ledger(status, lease_expires);
+                """)
+                conn.commit()
+        logging.info("Distributed Ledger Schema Verified Successfully.")
+    except Exception as e:
+        logging.error(f"Migration Error: {e}")
+
+# ==============================================================================
+# 4. LEASE-BASED IDEMPOTENT DELIVERY WITH FAIL-CLOSED GATING
+# ==============================================================================
+def acquire_distributed_lease(signal_id, symbol, direction):
+    if not DATABASE_URL or psycopg2 is None: 
+        logging.error("Distributed ledger unavailable — signal delivery blocked (Fail-closed).")
+        return False 
+    
+    current_time_utc = datetime.now(timezone.utc)
+    lease_expires_utc = current_time_utc + timedelta(seconds=LEASE_DURATION_SEC)
+    
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
                 sql = """
                 INSERT INTO signals_ledger (signal_id, symbol, direction, status, claimer, lease_expires, attempts)
                 VALUES (%s, %s, %s, 'PENDING', %s, %s, 1)
@@ -62,21 +102,22 @@ def acquire_distributed_lease(signal_id, symbol, direction, current_time):
                     claimer = EXCLUDED.claimer,
                     lease_expires = EXCLUDED.lease_expires,
                     attempts = signals_ledger.attempts + 1
-                WHERE signals_ledger.status = 'FAILED'
-                   OR (signals_ledger.status = 'PENDING' AND signals_ledger.lease_expires < %s)
+                WHERE (signals_ledger.status = 'FAILED' AND signals_ledger.attempts < %s)
+                   OR (signals_ledger.status = 'PENDING' AND signals_ledger.lease_expires < %s AND signals_ledger.attempts < %s)
                 RETURNING status;
                 """
-                cur.execute(sql, (signal_id, symbol, direction, INSTANCE_ID, lease_expires, current_time))
+                cur.execute(sql, (signal_id, symbol, direction, INSTANCE_ID, lease_expires_utc, MAX_ATTEMPTS, current_time_utc, MAX_ATTEMPTS))
                 result = cur.fetchone()
                 conn.commit()
-                return result is not None # True if we successfully acquired the lock/lease
+                return result is not None 
     except Exception as e:
         logging.error(f"DB Lock Error: {e}")
-        return False
+        return False 
 
 def commit_signal_state(signal_id, status):
-    """Updates ledger after Telegram Side-Effect"""
-    if not DATABASE_URL: return
+    if not DATABASE_URL or psycopg2 is None: 
+        return False
+        
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
@@ -85,23 +126,22 @@ def commit_signal_state(signal_id, status):
                     SET status = %s, sent_at = NOW() 
                     WHERE signal_id = %s AND claimer = %s
                 """, (status, signal_id, INSTANCE_ID))
+                updated = cur.rowcount
                 conn.commit()
+                return updated == 1
     except Exception as e:
         logging.error(f"DB Commit Error: {e}")
+        return False
 
 def distributed_signal_pipeline(symbol, direction, score, btc_regime, closed_timestamp, atr_pct, display_icon):
-    """v59.1: Effectively-Once Idempotent Delivery Layer"""
     sig_string = f"{symbol}_{closed_timestamp}_{direction}"
     signal_id = hashlib.sha256(sig_string.encode()).hexdigest()[:16]
-    current_time = time.time()
     
-    # 1. ATOMIC CLAIM (No more race conditions!)
-    if not acquire_distributed_lease(signal_id, symbol, direction, current_time):
-        return False # Lost race, or already sent, or lease currently held by another instance
+    if not acquire_distributed_lease(signal_id, symbol, direction):
+        return False 
             
-    # 2. EXTERNAL SIDE EFFECT (TELEGRAM)
     msg = (
-        f"⚡ <b>Prime Samaresh Engine v59.1</b>\n"
+        f"⚡ <b>Prime Samaresh Engine v59.7</b>\n"
         f"🪙 <b>Pair:</b> {symbol}\n"
         f"📈 <b>Action:</b> {direction} {display_icon}\n"
         f"🔥 <b>Conviction Score:</b> {score}/100\n"
@@ -117,33 +157,40 @@ def distributed_signal_pipeline(symbol, direction, score, btc_regime, closed_tim
         telegram_ok = resp.ok
     except: pass
     
-    # 3. EVENT LEDGER COMMIT
     if telegram_ok:
-        commit_signal_state(signal_id, "SENT")
-        return True
+        if commit_signal_state(signal_id, "SENT"):
+            return True
+        logging.error(f"Telegram sent but ledger commit failed (Phantom Delivery possible): {signal_id}")
+        return False
     else:
-        commit_signal_state(signal_id, "FAILED") # Releases lease implicitly for retries
+        commit_signal_state(signal_id, "FAILED")
         return False
 
 # ==============================================================================
-# 4. V59.1 TRUE SMC LIFECYCLE ENGINE
+# 5. SMC LIFECYCLE ENGINE (NATIVE INDICATORS)
 # ==============================================================================
 def fetch_ohlcv(exchange, symbol, timeframe):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=301)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df.iloc[:-1].copy() # Explicit Closed Candle
+        return df.iloc[:-1].copy() 
     except Exception as e:
         logging.error(f"Fetch error {symbol} {timeframe}: {e}")
         return None
 
 def calculate_smc_features(df):
-    """v59.1: Proper UNKNOWN->BREAK State Machine & Active FVG Lifecycle"""
-    df['ema_50'] = ta.ema(df['close'], length=50)
-    df['ema_200'] = ta.ema(df['close'], length=200)
+    df['ema_50'] = df['close'].ewm(span=50, adjust=False, min_periods=50).mean()
+    df['ema_200'] = df['close'].ewm(span=200, adjust=False, min_periods=200).mean()
     
-    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    prev_close = df['close'].shift(1)
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - prev_close).abs(),
+        (df['low'] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+
     atr_min = df['atr'].rolling(window=100, min_periods=50).min()
     atr_max = df['atr'].rolling(window=100, min_periods=50).max()
     df['atr_percentile'] = ((df['atr'] - atr_min) / (atr_max - atr_min).replace(0, np.nan)).fillna(0.5)
@@ -164,15 +211,13 @@ def calculate_smc_features(df):
     bos_bull, choch_bull, bos_bear, choch_bear = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool), np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
     fvg_tapped_bull, fvg_tapped_bear = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
     
-    trend = 0 # 0=UNKNOWN, 1=BULLISH, -1=BEARISH
-    active_bull_fvgs = [] # Track real objects: {idx, top, bot, taps}
-    active_bear_fvgs = []
+    trend = 0 
+    active_bull_fvgs, active_bear_fvgs = [], []
     
     for i in range(2, n):
         c, o, h, l = closes[i], opens[i], highs[i], lows[i]
         prev_sh, prev_sl = swing_highs[i-1], swing_lows[i-1]
         
-        # --- A. True SMC Structure Machine ---
         if not np.isnan(prev_sh) and c > prev_sh:
             if trend == 0: initial_break_bull[i] = True
             elif trend == -1: choch_bull[i] = True
@@ -185,29 +230,23 @@ def calculate_smc_features(df):
             elif trend == -1: bos_bear[i] = True
             trend = -1 
             
-        # --- B. Strict Active FVG Lifecycle ---
-        # Creation
         if l > highs[i-2] and c > o:
             active_bull_fvgs.append({'idx': i, 'top': l, 'bot': highs[i-2], 'taps': 0})
         if h < lows[i-2] and c < o:
             active_bear_fvgs.append({'idx': i, 'top': lows[i-2], 'bot': h, 'taps': 0})
             
-        # Evaluation & Mitigation (Only evaluate the LATEST valid FVG)
-        # Bullish
         valid_bull_fvgs = []
         for fvg in active_bull_fvgs:
-            if c < fvg['bot']: continue # Invalidated
+            if c < fvg['bot']: continue 
             valid_bull_fvgs.append(fvg)
         active_bull_fvgs = valid_bull_fvgs
         
         if active_bull_fvgs:
-            latest_fvg = active_bull_fvgs[-1] # Focus ONLY on the most recent uninvalidated FVG
-            if l <= latest_fvg['top'] and c >= latest_fvg['bot']: # Tap + Hold
-                if latest_fvg['taps'] == 0:
-                    fvg_tapped_bull[i] = True # Signal ONLY on FIRST tap of the LATEST active FVG
+            latest_fvg = active_bull_fvgs[-1] 
+            if l <= latest_fvg['top'] and c >= latest_fvg['bot']: 
+                if latest_fvg['taps'] == 0: fvg_tapped_bull[i] = True 
                 latest_fvg['taps'] += 1
 
-        # Bearish
         valid_bear_fvgs = []
         for fvg in active_bear_fvgs:
             if c > fvg['top']: continue 
@@ -217,8 +256,7 @@ def calculate_smc_features(df):
         if active_bear_fvgs:
             latest_fvg = active_bear_fvgs[-1]
             if h >= latest_fvg['bot'] and c <= latest_fvg['top']:
-                if latest_fvg['taps'] == 0:
-                    fvg_tapped_bear[i] = True
+                if latest_fvg['taps'] == 0: fvg_tapped_bear[i] = True
                 latest_fvg['taps'] += 1
 
     df['initial_break_bull'], df['bos_bull'], df['choch_bull'] = initial_break_bull, bos_bull, choch_bull
@@ -253,7 +291,7 @@ def analyze_btc_regime(exchange):
     return res
 
 # ==============================================================================
-# 5. DETERMINISTIC SCORE ENGINE
+# 6. DETERMINISTIC SCORE ENGINE
 # ==============================================================================
 def evaluate_engine_score(df_1h, df_15m, df_5m, direction, btc_regime):
     c1h, c15m, c5m = df_1h.iloc[-1], df_15m.iloc[-1], df_5m.iloc[-1]
@@ -271,7 +309,6 @@ def evaluate_engine_score(df_1h, df_15m, df_5m, direction, btc_regime):
         if c5m['fvg_tapped_bull']: cat_fvg += 15
         if c5m['orderflow_bull']: cat_fvg += 10
         
-        # Neutral = 0 Points (Confirmation requirement)
         if btc_regime in ["BULL", "STRONG_BULL"]: cat_regime += 20
             
     elif direction == "BEAR":
@@ -293,7 +330,7 @@ def evaluate_engine_score(df_1h, df_15m, df_5m, direction, btc_regime):
     return total_score, is_valid
 
 # ==============================================================================
-# 6. SCANNER CYCLE
+# 7. SCANNER CYCLE
 # ==============================================================================
 def run_scan_cycle(exchange):
     btc_regime = analyze_btc_regime(exchange)
@@ -314,7 +351,7 @@ def run_scan_cycle(exchange):
         
         direction, score, display_icon = None, 0, ""
         if bull_valid and bear_valid:
-            pass # Mutual Suppression
+            pass 
         elif bull_valid:
             direction, score, display_icon = "BULL", bull_score, "🟢"
         elif bear_valid:
@@ -323,29 +360,31 @@ def run_scan_cycle(exchange):
         if direction:
             closed_timestamp = df_5m['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
             atr_pct = df_5m['atr_percentile'].iloc[-1]
-            # TRUE ATOMIC PIPELINE
             distributed_signal_pipeline(symbol, direction, score, btc_regime, closed_timestamp, atr_pct, display_icon)
         
         del df_1h, df_15m, df_5m 
 
 # ==============================================================================
-# 7. WORKER LIFECYCLE (JITTERED 5M BOUNDARY SCHEDULER)
+# 8. WORKER LIFECYCLE
 # ==============================================================================
 def get_next_scan_time():
-    """Waits for 5-minute boundary + 15 seconds (Jitter) for API Closed Candle Guarantees"""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     remainder = 5 - (now.minute % 5)
     next_boundary = now + timedelta(minutes=remainder)
-    next_boundary = next_boundary.replace(second=15, microsecond=0)
+    next_boundary = next_boundary.replace(second=0, microsecond=0)
     return next_boundary.timestamp()
 
 def scanner_worker_loop():
-    logging.info(f"Prime Samaresh Engine v59.1 Worker Started (ID: {INSTANCE_ID})")
+    logging.info(f"Prime Samaresh Engine v59.7 Worker Started (ID: {INSTANCE_ID})")
     exchange = None
+    
+    initialize_database()
+    
     while not STOP_EVENT.is_set():
         try:
             next_scan = get_next_scan_time()
-            sleep_duration = max(0.0, next_scan - time.time())
+            jitter = random.uniform(5.0, 15.0) 
+            sleep_duration = max(0.0, next_scan - time.time()) + jitter
             
             if STOP_EVENT.wait(sleep_duration): 
                 break 
@@ -377,10 +416,10 @@ def start_background_scanner():
         except: return False
 
 # ==============================================================================
-# 8. STREAMLIT UI
+# 9. STREAMLIT UI
 # ==============================================================================
-st.markdown("## Prime Samaresh Engine v59.1")
-st.markdown("**Distributed Institutional Ledger Architecture**")
+st.markdown("## Prime Samaresh Engine v59.7")
+st.markdown("**Strict Distributed Ledger Architecture (Fail-Closed Execution)**")
 
 start_background_scanner()
 
@@ -394,9 +433,11 @@ st.write("---")
 col1, col2 = st.columns(2)
 col1.metric("System Memory (RSS)", f"{psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024):.2f} MB")
 col2.metric("Engine Status", engine_status)
-st.metric("Database Status", "Connected 🟢" if DATABASE_URL else "No Database 🔴")
+
+db_status = "Connected 🟢" if DATABASE_URL else "Not Configured 🔴 (Delivery Blocked)"
+st.metric("Database Status", db_status)
 st.metric("Instance ID", INSTANCE_ID)
 st.write("---")
-st.info("💡 **Note:** Score represents Deterministic Conviction (0-100), not a statistically calibrated win probability.")
+st.info("💡 **Note:** To run this distributed worker, a PostgreSQL database MUST be attached via `DATABASE_URL` environment variable.")
 
 st_autorefresh(interval=60000, key="datarefresh")
