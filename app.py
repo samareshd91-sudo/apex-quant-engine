@@ -3,7 +3,7 @@ import streamlit as st
 # ==============================================================================
 # 0. STREAMLIT CONFIG & STABLE RUNTIME IDENTITY
 # ==============================================================================
-st.set_page_config(page_title="Prime Samaresh Engine v75", page_icon="⚙️", layout="centered")
+st.set_page_config(page_title="Prime Samaresh Engine v75.2", page_icon="⚙️", layout="centered")
 
 import ccxt
 import pandas as pd
@@ -51,10 +51,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL") 
 
 COINS = ['ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
-LEASE_DURATION_SEC = 180 # v75 P0 Fix: Extended to safely absorb max backoff limits without fencing conflicts
+LEASE_DURATION_SEC = 180 
 COOLDOWN_MINUTES = 15  
 MAX_DELIVERY_ATTEMPTS = 2 
-MAX_TELEGRAM_BACKOFF_SEC = 30 # v75 P0 Fix: Hard cap to prevent infinite sleep / lease expiration
+MAX_TELEGRAM_BACKOFF_SEC = 30 
 OHLCV_LIMIT = 240 
 
 LEDGER_CLAIMED = "CLAIMED"
@@ -77,9 +77,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 def get_global_primitives():
     return threading.Lock(), threading.Event(), {
         "last_reconcile": 0.0,
-        "last_scan_completed": 0.0, # v75 P1 Fix: Semantically honest naming
+        "last_scan_completed": 0.0, 
         "scan_counter": 0,
-        "data_feed_errors": 0, # v75 P1 Fix: Operational monitoring
+        "data_feed_errors": 0, 
         "is_leader": False,
         "worker_health": "OFFLINE 🔴"
     }
@@ -133,14 +133,14 @@ def get_db_connection():
                     except Exception: pass
 
 # ==============================================================================
-# 3. DATABASE MIGRATION & HEALTH CHECK 
+# 3. DATABASE MIGRATION & HEALTH CHECK (P0 FIX APPLIED)
 # ==============================================================================
 def check_db_health():
     with get_db_connection() as conn:
         if not conn: return False
         try:
             with conn.cursor() as cur:
-                cur.execute("SET statement_timeout = 2000;") 
+                cur.execute("SET LOCAL statement_timeout = 2000;") 
                 cur.execute("SELECT 1;")
                 return cur.fetchone() is not None
         except Exception: 
@@ -163,7 +163,7 @@ def initialize_database():
                         signal_id VARCHAR(64) PRIMARY KEY,
                         symbol VARCHAR(32) NOT NULL,
                         direction VARCHAR(10) NOT NULL,
-                        status VARCHAR(32) NOT NULL DEFAULT '{LEDGER_CLAIMED}',
+                        status VARCHAR(64) NOT NULL DEFAULT '{LEDGER_CLAIMED}',
                         claimer VARCHAR(32),
                         lease_expires TIMESTAMPTZ,
                         takeover_count INTEGER NOT NULL DEFAULT 0,
@@ -179,52 +179,37 @@ def initialize_database():
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logging.critical(f"Failed to acquire migration lock or create base table: {e}")
-            return False
 
-        migrations = [
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS takeover_count INTEGER NOT NULL DEFAULT 0;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS claim_attempts INTEGER NOT NULL DEFAULT 0;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS claim_version BIGINT NOT NULL DEFAULT 0;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR(64);",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_response_audit TEXT;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS last_error TEXT;",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
-            "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
-        ]
-        
-        migration_failed = False
-        for query in migrations:
-            try:
-                with conn.cursor() as cur:
+                migrations = [
+                    "ALTER TABLE signals_ledger ALTER COLUMN status TYPE VARCHAR(64);",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS takeover_count INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS claim_attempts INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS claim_version BIGINT NOT NULL DEFAULT 0;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR(64);",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS telegram_response_audit TEXT;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS last_error TEXT;",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
+                    "ALTER TABLE signals_ledger ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
+                ]
+                
+                for query in migrations:
                     cur.execute(query)
-                conn.commit()
-            except Exception as e:
-                conn.rollback() 
-                if "already exists" not in str(e).lower() and "duplicate column" not in str(e).lower():
-                    migration_failed = True
-                    logging.error(f"Migration failed: {e}")
-        
-        if migration_failed:
-            logging.critical("Database migration incomplete. Worker will not start.")
-            return False
 
-        try:
-            with conn.cursor() as cur:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_status_lease ON signals_ledger(status, lease_expires);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_claimer ON signals_ledger(claimer);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_symbol_sent ON signals_ledger(symbol, sent_at);")
-            conn.commit()
-        except Exception:
-            conn.rollback()
 
-        logging.info("v75 Zenith Ledger migrated successfully.")
-        return True
+            conn.commit()
+            logging.info("v75.2 Zenith Ledger migrated successfully (P0 transaction-scoped migration lock).")
+            return True
+
+        except Exception as e:
+            try: conn.rollback()
+            except Exception: pass
+            logging.critical(f"Database migration failed and was rolled back: {e}")
+            return False
 
 # ==============================================================================
 # 4. RECONCILIATION WORKER
@@ -264,7 +249,7 @@ def get_pending_audit_count():
         if not conn: return 0
         try:
             with conn.cursor() as cur:
-                cur.execute("SET statement_timeout = 2000;") 
+                cur.execute("SET LOCAL statement_timeout = 2000;") 
                 cur.execute(f"SELECT COUNT(*) FROM signals_ledger WHERE status = '{LEDGER_AUDIT}';")
                 return cur.fetchone()[0]
         except Exception:
@@ -273,7 +258,7 @@ def get_pending_audit_count():
             return 0
 
 # ==============================================================================
-# 5. ATOMIC CLAIMING + PER-SYMBOL TRANSACTION LOCK
+# 5. ATOMIC CLAIMING + PER-SYMBOL TRANSACTION LOCK (P0 CLAIMED RECOVERY FIX)
 # ==============================================================================
 def acquire_distributed_lease(signal_id, symbol, direction):
     now = datetime.now(timezone.utc)
@@ -295,8 +280,15 @@ def acquire_distributed_lease(signal_id, symbol, direction):
                     SELECT 1 FROM signals_ledger 
                     WHERE symbol = %s AND (
                         status = '{LEDGER_AUDIT}'
-                        OR (status = '{LEDGER_SENT}' AND sent_at > NOW() - %s::interval)
-                        OR (status IN ('{LEDGER_CLAIMED}', '{LEDGER_SENDING}', '{LEDGER_UNKNOWN}') AND updated_at > NOW() - INTERVAL '10 minutes')
+                        OR (
+                            status = '{LEDGER_SENT}' 
+                            AND direction = %s 
+                            AND sent_at > NOW() - %s::interval
+                        )
+                        OR (
+                            status IN ('{LEDGER_CLAIMED}', '{LEDGER_SENDING}', '{LEDGER_UNKNOWN}') 
+                            AND updated_at > NOW() - INTERVAL '10 minutes'
+                        )
                     )
                 )
                 ON CONFLICT (signal_id) DO UPDATE SET
@@ -309,16 +301,19 @@ def acquire_distributed_lease(signal_id, symbol, direction):
                     claim_attempts = signals_ledger.claim_attempts + 1,
                     claim_version = signals_ledger.claim_version + 1,
                     last_error = NULL, updated_at = NOW()
-                WHERE signals_ledger.status = '{LEDGER_FAILED}'
-                  AND (signals_ledger.lease_expires IS NULL OR signals_ledger.lease_expires < %s)
+                WHERE (
+                        (signals_ledger.status = '{LEDGER_FAILED}' AND (signals_ledger.lease_expires IS NULL OR signals_ledger.lease_expires < %s))
+                        OR 
+                        (signals_ledger.status = '{LEDGER_CLAIMED}' AND signals_ledger.lease_expires < %s)
+                      )
                   AND signals_ledger.delivery_attempts < %s
                 RETURNING signal_id, claim_version, lease_expires, claim_attempts, takeover_count;
                 """
                 
                 cur.execute(sql, (
                     signal_id, symbol, direction, LEDGER_CLAIMED, INSTANCE_ID, lease_expires,
-                    symbol, f"{COOLDOWN_MINUTES} minutes",
-                    now, MAX_DELIVERY_ATTEMPTS
+                    symbol, direction, f"{COOLDOWN_MINUTES} minutes",
+                    now, now, MAX_DELIVERY_ATTEMPTS
                 ))
                 row = cur.fetchone()
                 conn.commit()
@@ -371,7 +366,7 @@ def commit_signal_state(signal_id, claim_version, target_status, message_id=None
             return False
 
 # ==============================================================================
-# 6. SMC LIFECYCLE ENGINE
+# 6. SMC LIFECYCLE ENGINE (FROZEN FOR FORWARD TESTING)
 # ==============================================================================
 def fetch_ohlcv(exchange, symbol, timeframe):
     try:
@@ -542,7 +537,7 @@ def analyze_btc_regime(exchange):
     return "NEUTRAL"
 
 # ==============================================================================
-# 7. SCORING MODEL
+# 7. SCORING MODEL (FROZEN FOR FORWARD TESTING)
 # ==============================================================================
 def evaluate_engine_score(df_1h, df_15m, df_5m, direction, btc_regime):
     if len(df_1h) < 210 or len(df_15m) < 210 or len(df_5m) < 210:
@@ -585,7 +580,7 @@ def evaluate_engine_score(df_1h, df_15m, df_5m, direction, btc_regime):
     return total_score, structural_valid
 
 # ==============================================================================
-# 8. TELEGRAM PIPELINE (v75 P0 FIX: SAFE LEASE & 429 HANDLING)
+# 8. TELEGRAM PIPELINE
 # ==============================================================================
 def distributed_signal_pipeline(symbol, direction, score, btc_regime, df_5m, atr_pos, display_icon):
     closed_ts_ms = int((df_5m['timestamp'].iloc[-1] + pd.Timedelta(minutes=5)).timestamp() * 1000)
@@ -603,7 +598,7 @@ def distributed_signal_pipeline(symbol, direction, score, btc_regime, df_5m, atr
         return False
 
     msg = (
-        f"⚡ <b>Prime Samaresh Engine v75</b>\n"
+        f"⚡ <b>Prime Samaresh Engine v75.2</b>\n"
         f"🪙 <b>Pair:</b> {symbol}\n"
         f"📈 <b>Action:</b> {direction} {display_icon}\n"
         f"🔥 <b>Conviction Score:</b> {score}/100\n"
@@ -618,14 +613,12 @@ def distributed_signal_pipeline(symbol, direction, score, btc_regime, df_5m, atr
         return TELEGRAM_SESSION.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
     
     try:
-        # v75 P0 Fix: Fast-fail FAILED classification on missing credentials (no ambiguity)
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             commit_signal_state(signal_id, claim_version, LEDGER_FAILED, error_message="Fatal: Telegram credentials missing")
             return False
             
         response = attempt_telegram_delivery()
         
-        # v75 P0 Fix: Enforced Hard Cap on 429 Retry-After to prevent lease expiration fencing failures
         if response.status_code == 429:
             try: retry_data = response.json()
             except: retry_data = {}
@@ -755,14 +748,13 @@ def get_next_scan_time():
     return next_boundary.replace(second=0, microsecond=0).timestamp()
 
 def scanner_worker_loop():
-    logging.info(f"Prime Samaresh Engine v75 Worker Started (ID: {INSTANCE_ID})")
+    logging.info(f"Prime Samaresh Engine v75.2 Worker Started (ID: {INSTANCE_ID})")
     
     if not initialize_database():
         logging.critical("Database initialization failed. Worker shutting down.")
         SHARED_STATE["worker_health"] = "DB SETUP FAILED 🔴"
         return
 
-    # v75 P1 Fix: Immediate startup reconciliation sweeps any pre-existing stuck states safely into AUDIT
     reconcile_ledger(force=True)
 
     leader_conn = None
@@ -790,8 +782,16 @@ def scanner_worker_loop():
                 if leader_conn is None or not ping_leader_conn(leader_conn):
                     try:
                         if leader_conn: leader_conn.close()
-                        leader_conn = psycopg2.connect(DATABASE_URL, connect_timeout=5, options="-c statement_timeout=5000")
+                        
+                        leader_conn = psycopg2.connect(
+                            DATABASE_URL,
+                            connect_timeout=5
+                        )
                         leader_conn.autocommit = True
+                        
+                        with leader_conn.cursor() as l_cur:
+                            l_cur.execute("SET statement_timeout = 5000;")
+                            
                     except Exception as e:
                         logging.error(f"Failed to connect for leader election: {e}")
                         leader_conn = None
@@ -822,7 +822,6 @@ def scanner_worker_loop():
             
             run_scan_cycle(exchange)
             
-            # v75 P1 Fix: Real-time Data Feed health translation 
             if SHARED_STATE["data_feed_errors"] > 0:
                 SHARED_STATE["worker_health"] = "DATA FEED DOWN 🟡"
             else:
@@ -865,8 +864,8 @@ def start_background_scanner():
 # ==============================================================================
 # 11. STREAMLIT UI
 # ==============================================================================
-st.markdown("## Prime Samaresh Engine v75")
-st.markdown("**The Zenith Master Build: Uncompromising Delivery & Ledger Durability**")
+st.markdown("## Prime Samaresh Engine v75.2")
+st.markdown("**Infrastructure Patch: Atomic Migration & Direction-Aware Cooldown (Strategy Frozen)**")
 
 start_background_scanner()
 
@@ -899,6 +898,6 @@ if pending_audits > 0:
     st.warning(f"⚠️ {pending_audits} signals are in `DELIVERY_AUDIT_REQUIRED` state. Manual Telegram verification needed.")
 
 st.write("---")
-st.info("💡 **v75 Final Architectural State:** Employs an exact HTTP 4xx/5xx state machine for fault-tolerant Telegram dispatching, secures PostgreSQL schema mutations via singleton Advisory Migration Locks, mathematically decouples displacement baselines from current active thresholds, hard-caps external API backoffs to safeguard internal 180s lease durations, and executes fail-safe startup reconciliations establishing an irrefutably durable Signal Ledger.")
+st.info("💡 **v75.2 State:** SMC Strategy is permanently frozen for forward testing. Infrastructure features include strictly atomic PostgreSQL schema migrations wrapped in transaction-scoped advisory locks, fencing-aware lease verification ensuring Durable at-least-once delivery with strict auditability, and protection against stale lease lockups without falsely blocking opposite-direction setups.")
 
 st_autorefresh(interval=120000, key="datarefresh")
